@@ -302,11 +302,25 @@ def _identity_headers(dsid, idms_token):
     return headers
 
 
+def _second_factor_session(headers):
+    """Create the cookie-bearing GSA session required by current 2FA endpoints."""
+    session = requests.Session()
+    response = session.get(
+        "https://gsa.apple.com/auth",
+        headers=headers,
+        verify=False,
+        timeout=10,
+    )
+    response.raise_for_status()
+    return session, response
+
+
 def trusted_second_factor(dsid, idms_token):
     """Use the GSA trusted-device path that matches the SRP login session."""
     headers = _identity_headers(dsid, idms_token)
+    session, _ = _second_factor_session(headers)
 
-    with requests.get(
+    with session.get(
             "https://gsa.apple.com/auth/verify/trusteddevice",
             headers=headers,
             verify=False,
@@ -319,7 +333,7 @@ def trusted_second_factor(dsid, idms_token):
         raise AppleAuthError("Trusted-device verification requires a 6-digit code")
 
     headers["security-code"] = code
-    with requests.get(
+    with session.get(
             "https://gsa.apple.com/grandslam/GsService2/validate",
             headers=headers,
             verify=False,
@@ -334,8 +348,8 @@ def sms_second_factor(dsid, idms_token):
     """Accept an Apple-delivered SMS code without mixing GSA and web sessions."""
     headers = _identity_headers(dsid, idms_token)
     pattern = r'<script.*class="boot_args">\s*(.*?)\s*</script>'
-    with requests.get("https://gsa.apple.com/auth", headers=headers, verify=False) as auth:
-        auth.raise_for_status()
+    session, auth = _second_factor_session(headers)
+    with auth:
         sms_id = 1
         match = re.search(pattern, auth.text, re.DOTALL)
         if match:
@@ -363,7 +377,7 @@ def sms_second_factor(dsid, idms_token):
         "mode": "sms",
         "securityCode": {"code": code},
     }
-    with requests.post(
+    with session.post(
             "https://gsa.apple.com/auth/verify/phone/securitycode",
             json=body,
             headers=headers,
