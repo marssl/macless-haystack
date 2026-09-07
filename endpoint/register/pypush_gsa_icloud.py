@@ -1,4 +1,4 @@
-import time
+import os
 
 import urllib3
 from getpass import getpass
@@ -35,14 +35,49 @@ urllib3.disable_warnings()
 logger = logging.getLogger()
 
 
-def icloud_login_mobileme(username='', password=''):
+class AppleAuthError(RuntimeError):
+    """Raised when Apple returns a structured authentication failure."""
+
+
+def _raise_for_apple_status(response, stage):
+    status = response.get("Status") or {}
+    code = status.get("ec")
+    if code not in (None, 0):
+        message = status.get("em") or status.get("ed") or "Unknown Apple authentication error"
+        raise AppleAuthError(f"{stage} failed: {message} (Apple code {code})")
+
+
+def _require_fields(response, fields, stage):
+    missing = [field for field in fields if field not in response]
+    if missing:
+        raise AppleAuthError(f"{stage} returned an incomplete response; missing {', '.join(missing)}")
+
+
+def _second_factor_method(value=None):
+    method = (value or os.getenv("MACLESS_2FA_METHOD", "trusted_device")).strip().lower()
+    aliases = {"trusted": "trusted_device", "device": "trusted_device"}
+    method = aliases.get(method, method)
+    if method not in {"trusted_device", "sms", "auto"}:
+        raise AppleAuthError(
+            "MACLESS_2FA_METHOD must be trusted_device, sms, or auto"
+        )
+    if method == "auto":
+        choice = input("2FA method [trusted_device/sms] (default trusted_device): ").strip().lower()
+        method = aliases.get(choice, choice) if choice else "trusted_device"
+        if method not in {"trusted_device", "sms"}:
+            raise AppleAuthError("Unsupported 2FA method")
+    return method
+
+
+def icloud_login_mobileme(username='', password='', second_factor=None):
     print("")  # Sometimes no output
     if not username:
         username = input('Apple ID: ')
     if not password:
         password = getpass('Password: ')
+    username = username.strip()
 
-    g = gsa_authenticate(username, password)
+    g = gsa_authenticate(username, password, _second_factor_method(second_factor))
     pet = g["t"]["com.apple.gs.idms.pet"]["token"]
     adsid = g["adsid"]
 
@@ -74,7 +109,7 @@ def icloud_login_mobileme(username='', password=''):
     return plist.loads(resp.content)
 
 
-def gsa_authenticate(username, password):
+def gsa_authenticate(username, password, second_factor="trusted_device", two_factor_round=0):
     # Password is None as we'll provide it later
     usr = srp.User(username, bytes(), hash_alg=srp.SHA256, ng_type=srp.NG_2048)
     _, a = usr.start_authentication()
@@ -82,9 +117,12 @@ def gsa_authenticate(username, password):
     r = gsa_authenticated_request(
         {"A2k": a, "ps": ["s2k", "s2k_fo"], "u": username, "o": "init"})
 
+    _raise_for_apple_status(r, "Authentication initialization")
+    _require_fields(r, ["sp", "s", "i", "B", "c"], "Authentication initialization")
     if r["sp"] not in ["s2k", "s2k_fo"]:
-        logger.warning(f"This implementation only supports s2k and sk2_fo. Server returned {r['sp']}")
-        return
+        raise AppleAuthError(
+            f"Unsupported Apple password protocol: {r['sp']}"
+        )
 
     # Change the password out from under the SRP library, as we couldn't calculate it without the salt.
     usr.p = encrypt_password(password, r["s"], r["i"], r["sp"])
@@ -93,21 +131,18 @@ def gsa_authenticate(username, password):
 
     # Make sure we processed the challenge correctly
     if m is None:
-        logger.error("Failed to process challenge")
-        return
+        raise AppleAuthError("Failed to process Apple's authentication challenge")
     logger.info("Authentication request completion")
     resp = gsa_authenticated_request(
         {"c": r["c"], "M1": m, "u": username, "o": "complete"})
 
+    _raise_for_apple_status(resp, "Authentication completion")
     # Make sure that the server's session key matches our session key (and thus that they are not an imposter)
     if "M2" not in resp:
-        logger.error("Error on authentication")
-        logger.error(resp)
-        return
+        raise AppleAuthError("Authentication completion did not return a server proof")
     usr.verify_session(resp["M2"])
     if not usr.authenticated():
-        logger.error("Failed to verify session")
-        return
+        raise AppleAuthError("Failed to verify Apple's authentication session")
 
     spd = decrypt_cbc(usr, resp["spd"])
     # For some reason plistlib doesn't accept it without the header...
@@ -117,18 +152,26 @@ def gsa_authenticate(username, password):
 """
     spd = plist.loads(PLISTHEADER + spd)
 
-    if "au" in resp["Status"] and resp["Status"]["au"] in ["trustedDeviceSecondaryAuth", "secondaryAuth"]:
-        logger.info("2FA required, requesting SMS code. (No other 2FA-code will work!)")
+    status = resp.get("Status") or {}
+    if status.get("au") in ["trustedDeviceSecondaryAuth", "secondaryAuth"]:
+        if two_factor_round >= 1:
+            raise AppleAuthError(
+                "Apple requested 2FA again after successful verification; "
+                "the Anisette device identity may be inconsistent"
+            )
+        logger.info("2FA required, using %s", second_factor)
         # Replace bytes with strings
         for k, v in spd.items():
             if isinstance(v, bytes):
                 spd[k] = base64.b64encode(v).decode()
-        sms_second_factor(spd["adsid"], spd["GsIdmsToken"])
+        if second_factor == "trusted_device":
+            trusted_second_factor(spd["adsid"], spd["GsIdmsToken"])
+        else:
+            sms_second_factor(spd["adsid"], spd["GsIdmsToken"])
 
-        return gsa_authenticate(username, password)
-    elif "au" in resp["Status"]:
-        logger.error(f"Unknown auth value {r['Status']['au']}")
-        return
+        return gsa_authenticate(username, password, second_factor, two_factor_round + 1)
+    elif "au" in status:
+        raise AppleAuthError(f"Unsupported Apple 2FA mode: {status['au']}")
     else:
         return spd
 
@@ -178,11 +221,26 @@ def generate_cpd():
 
 def generate_anisette_headers():
     with requests.get(mh_config.getAnisetteServer(), timeout=5) as response:
-        response.raise_for_status()  # Hebt Fehler hervor (z. B. 404 oder 500)
-        jsonResponse = response.json()
-        a = {"X-Apple-I-MD": jsonResponse["X-Apple-I-MD"],
-             "X-Apple-I-MD-M": jsonResponse["X-Apple-I-MD-M"]}
-        a.update(generate_meta_headers(user_id=USER_ID, device_id=DEVICE_ID))
+        response.raise_for_status()
+        anisette = response.json()
+        required = {"X-Apple-I-MD", "X-Apple-I-MD-M"}
+        missing = sorted(required - anisette.keys())
+        if missing:
+            raise AppleAuthError(
+                f"Anisette response is missing required headers: {', '.join(missing)}"
+            )
+
+        # Preserve the provisioned identity as one coherent unit. Mixing MD/MD-M
+        # from the server with locally generated device IDs makes Apple challenge
+        # the client repeatedly even after a valid second factor.
+        apple_headers = {
+            key: value for key, value in anisette.items()
+            if key.lower().startswith(("x-apple-", "x-mme-")) or key.lower() == "loc"
+        }
+        for key, value in generate_meta_headers(
+                user_id=USER_ID, device_id=DEVICE_ID).items():
+            apple_headers.setdefault(key, value)
+        a = apple_headers
     return a
 
 
@@ -229,13 +287,9 @@ def decrypt_cbc(usr, data):
     return padder.update(data) + padder.finalize()
 
 
-WAITING_TIME = 60
-
-
-def sms_second_factor(dsid, idms_token):
+def _identity_headers(dsid, idms_token):
     identity_token = base64.b64encode(
         (dsid + ":" + idms_token).encode()).decode()
-
     headers = {
         "User-Agent": "Xcode",
         "Accept-Language": "en-us",
@@ -244,10 +298,41 @@ def sms_second_factor(dsid, idms_token):
         "X-Xcode-Version": "11.2 (11B41)",
         "X-Mme-Client-Info": '<MacBookPro18,3> <Mac OS X;13.4.1;22F8> <com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>'
     }
-
     headers.update(generate_anisette_headers())
+    return headers
 
-    # Extract the "boot_args" from the auth page to get the id of the trusted phone number
+
+def trusted_second_factor(dsid, idms_token):
+    """Use the GSA trusted-device path that matches the SRP login session."""
+    headers = _identity_headers(dsid, idms_token)
+
+    with requests.get(
+            "https://gsa.apple.com/auth/verify/trusteddevice",
+            headers=headers,
+            verify=False,
+            timeout=10,
+    ) as response:
+        response.raise_for_status()
+
+    code = getpass("Enter the 6-digit code shown on a trusted Apple device: ").strip()
+    if not re.fullmatch(r"\d{6}", code):
+        raise AppleAuthError("Trusted-device verification requires a 6-digit code")
+
+    headers["security-code"] = code
+    with requests.get(
+            "https://gsa.apple.com/grandslam/GsService2/validate",
+            headers=headers,
+            verify=False,
+            timeout=10,
+    ) as response:
+        response.raise_for_status()
+
+    logger.info("Trusted-device 2FA successful")
+
+
+def sms_second_factor(dsid, idms_token):
+    """Accept an Apple-delivered SMS code without mixing GSA and web sessions."""
+    headers = _identity_headers(dsid, idms_token)
     pattern = r'<script.*class="boot_args">\s*(.*?)\s*</script>'
     with requests.get("https://gsa.apple.com/auth", headers=headers, verify=False) as auth:
         auth.raise_for_status()
@@ -255,79 +340,40 @@ def sms_second_factor(dsid, idms_token):
         match = re.search(pattern, auth.text, re.DOTALL)
         if match:
             boot_args = json.loads(match.group(1).strip())
-            try:
-                sms_id = boot_args["direct"]["phoneNumberVerification"]["trustedPhoneNumber"]["id"]
-            except KeyError as e:
-                logger.debug(match.group(1).strip())
-                logger.error("Key for sms id not found. Using the first phone number")
-        else:
-            logger.debug(auth.text)
-            logger.error("Script for sms id not found. Using the first phone number")
+            sms_id = boot_args.get("direct", {}).get(
+                "phoneNumberVerification", {}).get(
+                    "trustedPhoneNumber", {}).get("id", sms_id)
+        logger.info("Using phone with id %s for SMS2FA", sms_id)
 
-        logger.info(f"Using phone with id {sms_id} for SMS2FA")
-        body = {"phoneNumber": {"id": sms_id}, "mode": "sms"}
-        for handler in logger.handlers:
-            handler.flush()
-        # Prompt for the 2FA code. It's just a string like '123456', no dashes or spaces
-        start_time = time.perf_counter()
-        code = input(
-            f"Enter SMS 2FA code (If you do not receive a code, wait {WAITING_TIME}s and press Enter. An attempt will be made to request the SMS in another way.): ")
-        end_time = time.perf_counter()
+    code = input(
+        "Enter the 6-digit SMS code already delivered by Apple, "
+        "or type 'trusted' to use a trusted device instead: "
+    ).strip()
+    if code.lower() in {"trusted", "device", "trusted_device"}:
+        return trusted_second_factor(dsid, idms_token)
+    if not re.fullmatch(r"\d{6}", code):
+        raise AppleAuthError(
+            "No usable SMS code was received. Apple's idmsa resend endpoint "
+            "requires a web-auth session and cannot be called with a GSA identity token; "
+            "retry with MACLESS_2FA_METHOD=trusted_device."
+        )
 
-    if code == "":
-        elapsed_time = int(end_time - start_time)
-        if elapsed_time < WAITING_TIME:
-            waiting_time = WAITING_TIME - elapsed_time
-            logger.info(
-                f"You only waited {elapsed_time} seconds. The next request will be started in {waiting_time} seconds")
-            time.sleep(waiting_time)
-            code = input(f"Enter SMS 2FA code if you have received it in the meantime, otherwise press Enter: ")
-
-            if code == "":
-                code = request_code(headers,sms_id)
-        else:
-            code = request_code(headers,sms_id)
-
-    body['securityCode'] = {'code': code}
-
-    # Send the 2FA code to Apple
-    with  requests.post(
+    body = {
+        "phoneNumber": {"id": sms_id},
+        "mode": "sms",
+        "securityCode": {"code": code},
+    }
+    with requests.post(
             "https://gsa.apple.com/auth/verify/phone/securitycode",
             json=body,
             headers=headers,
             verify=False,
             timeout=5,
-    ) as resp:
-        resp.raise_for_status()
+    ) as response:
+        response.raise_for_status()
+        if "X-Apple-DSID" not in response.headers:
+            raise AppleAuthError(
+                "SMS verification was not accepted by the GSA session"
+            )
 
-    response = f"HTTP-Code: {resp.status_code} with {len(resp.text)} bytes"
-    logger.debug(response)
-    header_string = "Headers:\n"
-    for header, value in resp.headers.items():
-        header_string += f"{header}: {value}\n"
-    logger.debug(header_string)
-    # Headers does not include Apple DSID, 2FA failed
-    if resp.ok and "X-Apple-DSID" in resp.headers:
-        logger.info("2FA successful")
-    else:
-        raise Exception(
-            "2FA unsuccessful. Maybe wrong code or wrong number. Check your account details.")
-
-
-def request_code(headers,sms_id):
-    # This will send the 2FA code to the user's phone over SMS
-    # We don't care about the response, it's just some HTML with a form for entering the code
-    # Easier to just use a text prompt
-    logger.debug(headers)
-    body = {"phoneNumber": {"id": sms_id}, "mode": "sms"}
-    logger.info(f"Sending SMS via id {sms_id}")
-    with requests.put(
-            "https://idmsa.apple.com/appleauth/auth/verify/phone",
-            json=body,
-            headers=headers,
-            verify=False,
-            timeout=5
-    ) as req:
-        req.raise_for_status()
-    code = input(f"Enter SMS 2FA code:")
-    return code
+    logger.info("SMS 2FA successful")
