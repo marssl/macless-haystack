@@ -77,7 +77,13 @@ def icloud_login_mobileme(username='', password='', second_factor=None):
         password = getpass('Password: ')
     username = username.strip()
 
-    g = gsa_authenticate(username, password, _second_factor_method(second_factor))
+    session = requests.Session()
+    g = gsa_authenticate(
+        username,
+        password,
+        _second_factor_method(second_factor),
+        session=session,
+    )
     pet = g["t"]["com.apple.gs.idms.pet"]["token"]
     adsid = g["adsid"]
 
@@ -96,7 +102,7 @@ def icloud_login_mobileme(username='', password='', second_factor=None):
     headers.update(generate_anisette_headers())
 
     logger.info("Registering device after login")
-    with requests.post(
+    with session.post(
             "https://setup.icloud.com/setup/iosbuddy/loginDelegates",
             auth=(username, pet),
             data=data,
@@ -109,13 +115,22 @@ def icloud_login_mobileme(username='', password='', second_factor=None):
     return plist.loads(resp.content)
 
 
-def gsa_authenticate(username, password, second_factor="trusted_device", two_factor_round=0):
+def gsa_authenticate(
+        username,
+        password,
+        second_factor="trusted_device",
+        two_factor_round=0,
+        session=None,
+):
+    session = session or requests.Session()
     # Password is None as we'll provide it later
     usr = srp.User(username, bytes(), hash_alg=srp.SHA256, ng_type=srp.NG_2048)
     _, a = usr.start_authentication()
     logger.info("Authentication request initialization")
     r = gsa_authenticated_request(
-        {"A2k": a, "ps": ["s2k", "s2k_fo"], "u": username, "o": "init"})
+        {"A2k": a, "ps": ["s2k", "s2k_fo"], "u": username, "o": "init"},
+        session,
+    )
 
     _raise_for_apple_status(r, "Authentication initialization")
     _require_fields(r, ["sp", "s", "i", "B", "c"], "Authentication initialization")
@@ -134,7 +149,9 @@ def gsa_authenticate(username, password, second_factor="trusted_device", two_fac
         raise AppleAuthError("Failed to process Apple's authentication challenge")
     logger.info("Authentication request completion")
     resp = gsa_authenticated_request(
-        {"c": r["c"], "M1": m, "u": username, "o": "complete"})
+        {"c": r["c"], "M1": m, "u": username, "o": "complete"},
+        session,
+    )
 
     _raise_for_apple_status(resp, "Authentication completion")
     # Make sure that the server's session key matches our session key (and thus that they are not an imposter)
@@ -165,18 +182,25 @@ def gsa_authenticate(username, password, second_factor="trusted_device", two_fac
             if isinstance(v, bytes):
                 spd[k] = base64.b64encode(v).decode()
         if second_factor == "trusted_device":
-            trusted_second_factor(spd["adsid"], spd["GsIdmsToken"])
+            trusted_second_factor(spd["adsid"], spd["GsIdmsToken"], session)
         else:
-            sms_second_factor(spd["adsid"], spd["GsIdmsToken"])
+            sms_second_factor(spd["adsid"], spd["GsIdmsToken"], session)
 
-        return gsa_authenticate(username, password, second_factor, two_factor_round + 1)
+        return gsa_authenticate(
+            username,
+            password,
+            second_factor,
+            two_factor_round + 1,
+            session,
+        )
     elif "au" in status:
         raise AppleAuthError(f"Unsupported Apple 2FA mode: {status['au']}")
     else:
         return spd
 
 
-def gsa_authenticated_request(parameters):
+def gsa_authenticated_request(parameters, session=None):
+    session = session or requests.Session()
     body = {
         "Header": {"Version": "1.0.1"},
         "Request": {"cpd": generate_cpd()},
@@ -190,7 +214,7 @@ def gsa_authenticated_request(parameters):
         "X-MMe-Client-Info": '<MacBookPro18,3> <Mac OS X;13.4.1;22F8> <com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>'
     }
 
-    with  requests.post(
+    with session.post(
             "https://gsa.apple.com/grandslam/GsService2",
             headers=headers,
             data=plist.dumps(body),
@@ -302,23 +326,9 @@ def _identity_headers(dsid, idms_token):
     return headers
 
 
-def _second_factor_session(headers):
-    """Create the cookie-bearing GSA session required by current 2FA endpoints."""
-    session = requests.Session()
-    response = session.get(
-        "https://gsa.apple.com/auth",
-        headers=headers,
-        verify=False,
-        timeout=10,
-    )
-    response.raise_for_status()
-    return session, response
-
-
-def trusted_second_factor(dsid, idms_token):
+def trusted_second_factor(dsid, idms_token, session):
     """Use the GSA trusted-device path that matches the SRP login session."""
     headers = _identity_headers(dsid, idms_token)
-    session, _ = _second_factor_session(headers)
 
     with session.get(
             "https://gsa.apple.com/auth/verify/trusteddevice",
@@ -344,12 +354,17 @@ def trusted_second_factor(dsid, idms_token):
     logger.info("Trusted-device 2FA successful")
 
 
-def sms_second_factor(dsid, idms_token):
+def sms_second_factor(dsid, idms_token, session):
     """Accept an Apple-delivered SMS code without mixing GSA and web sessions."""
     headers = _identity_headers(dsid, idms_token)
     pattern = r'<script.*class="boot_args">\s*(.*?)\s*</script>'
-    session, auth = _second_factor_session(headers)
-    with auth:
+    with session.get(
+            "https://gsa.apple.com/auth",
+            headers=headers,
+            verify=False,
+            timeout=10,
+    ) as auth:
+        auth.raise_for_status()
         sms_id = 1
         match = re.search(pattern, auth.text, re.DOTALL)
         if match:
@@ -364,7 +379,7 @@ def sms_second_factor(dsid, idms_token):
         "or type 'trusted' to use a trusted device instead: "
     ).strip()
     if code.lower() in {"trusted", "device", "trusted_device"}:
-        return trusted_second_factor(dsid, idms_token)
+        return trusted_second_factor(dsid, idms_token, session)
     if not re.fullmatch(r"\d{6}", code):
         raise AppleAuthError(
             "No usable SMS code was received. Apple's idmsa resend endpoint "
