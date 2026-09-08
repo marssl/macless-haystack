@@ -1,4 +1,5 @@
 import os
+import time
 
 import urllib3
 from getpass import getpass
@@ -33,6 +34,17 @@ srp.no_username_in_x()
 urllib3.disable_warnings()
 
 logger = logging.getLogger()
+
+CLIENT_INFO = '<MacBookPro18,3> <Mac OS X;13.4.1;22F8> <com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>'
+
+
+def _check_http(response, stage):
+    # Authentication response bodies and cookies contain secrets. Report only
+    # status/shape; never dump XML, headers, or tokens to Docker logs.
+    logger.info('%s: HTTP %s, content-type=%s', stage,
+                response.status_code, response.headers.get('Content-Type', 'unknown'))
+    if not response.ok:
+        raise AppleAuthError(f'{stage}: HTTP {response.status_code}')
 
 
 class AppleAuthError(RuntimeError):
@@ -94,11 +106,11 @@ def icloud_login_mobileme(username='', password='', second_factor=None):
         "client-id": str(USER_ID),
     }
     data = plist.dumps(data)
-    headers = {
+    headers = requests.structures.CaseInsensitiveDict({
         "X-Apple-ADSID": adsid,
         "User-Agent": "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0",
         "X-Mme-Client-Info": '<MacBookPro18,3> <Mac OS X;13.4.1;22F8> <com.apple.AOSKit/282 (com.apple.accountsd/113)>'
-    }
+    })
     headers.update(generate_anisette_headers())
 
     logger.info("Registering device after login")
@@ -110,8 +122,7 @@ def icloud_login_mobileme(username='', password='', second_factor=None):
             verify=False,
     ) as resp:
         resp.raise_for_status()
-    response = f"HTTP-Code: {resp.status_code}\n{resp.text}"
-    logger.debug(response)
+    _check_http(resp, 'loginDelegates')
     return plist.loads(resp.content)
 
 
@@ -201,9 +212,10 @@ def gsa_authenticate(
 
 def gsa_authenticated_request(parameters, session=None):
     session = session or requests.Session()
+    anisette = generate_anisette_headers()
     body = {
         "Header": {"Version": "1.0.1"},
-        "Request": {"cpd": generate_cpd()},
+        "Request": {"cpd": generate_cpd(anisette)},
     }
     body["Request"].update(parameters)
 
@@ -211,25 +223,40 @@ def gsa_authenticated_request(parameters, session=None):
         "Content-Type": "text/x-xml-plist",
         "Accept": "*/*",
         "User-Agent": "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0",
-        "X-MMe-Client-Info": '<MacBookPro18,3> <Mac OS X;13.4.1;22F8> <com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>'
+        "X-MMe-Client-Info": anisette.get('X-Mme-Client-Info', CLIENT_INFO)
     }
 
-    with session.post(
-            "https://gsa.apple.com/grandslam/GsService2",
-            headers=headers,
-            data=plist.dumps(body),
-            verify=False,
-            timeout=5,
-    ) as resp:
-        resp.raise_for_status()
+    operation = parameters.get('o', 'request')
+    # Only initialization is replayed. Never automatically resend a password
+    # proof or second-factor request when its outcome is uncertain.
+    delays = (2, 5) if operation == 'init' else ()
+    for attempt in range(len(delays) + 1):
+        retry_delay = None
+        with session.post(
+                "https://gsa.apple.com/grandslam/GsService2",
+                headers=headers,
+                data=plist.dumps(body),
+                verify=False,
+                timeout=5,
+        ) as resp:
+            if resp.status_code in (502, 503, 504) and attempt < len(delays):
+                retry_delay = delays[attempt]
+                # Respect a short numeric Retry-After. Longer cooldowns should
+                # stop here rather than retaining a pending login indefinitely.
+                retry_after = resp.headers.get('Retry-After', '')
+                if retry_after.isdigit():
+                    if int(retry_after) > 30:
+                        raise AppleAuthError('GSA init: server requested a longer cooldown; stop retrying')
+                    retry_delay = max(retry_delay, int(retry_after))
+                logger.warning('GSA init: HTTP %s; retry %s/2 in %ss',
+                               resp.status_code, attempt + 1, retry_delay)
+            else:
+                _check_http(resp, 'GSA ' + operation)
+                return plist.loads(resp.content)["Response"]
+        time.sleep(retry_delay)
 
-    response = f"HTTP-Code: {resp.status_code}\n{resp.text}"
-    logger.debug(response)
 
-    return plist.loads(resp.content)["Response"]
-
-
-def generate_cpd():
+def generate_cpd(anisette=None):
     cpd = {
         # Many of these values are not strictly necessary, but may be tracked by Apple
         "bootstrap": True,  # All implementations set this to true
@@ -239,7 +266,8 @@ def generate_cpd():
         "svct": "iCloud",  # In certian circumstances, this can be 'iTunes' or 'iCloud'
     }
 
-    cpd.update(generate_anisette_headers())
+    cpd.update({k: v for k, v in (anisette if anisette is not None else generate_anisette_headers()).items()
+                if k.lower() != 'x-mme-client-info'})
     return cpd
 
 
@@ -257,10 +285,10 @@ def generate_anisette_headers():
         # Preserve the provisioned identity as one coherent unit. Mixing MD/MD-M
         # from the server with locally generated device IDs makes Apple challenge
         # the client repeatedly even after a valid second factor.
-        apple_headers = {
+        apple_headers = requests.structures.CaseInsensitiveDict({
             key: value for key, value in anisette.items()
             if key.lower().startswith(("x-apple-", "x-mme-")) or key.lower() == "loc"
-        }
+        })
         for key, value in generate_meta_headers(
                 user_id=USER_ID, device_id=DEVICE_ID).items():
             apple_headers.setdefault(key, value)
@@ -314,14 +342,14 @@ def decrypt_cbc(usr, data):
 def _identity_headers(dsid, idms_token):
     identity_token = base64.b64encode(
         (dsid + ":" + idms_token).encode()).decode()
-    headers = {
+    headers = requests.structures.CaseInsensitiveDict({
         "User-Agent": "Xcode",
         "Accept-Language": "en-us",
         "X-Apple-Identity-Token": identity_token,
         "X-Apple-App-Info": "com.apple.gs.xcode.auth",
         "X-Xcode-Version": "11.2 (11B41)",
         "X-Mme-Client-Info": '<MacBookPro18,3> <Mac OS X;13.4.1;22F8> <com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>'
-    }
+    })
     headers.update(generate_anisette_headers())
     return headers
 
@@ -329,6 +357,8 @@ def _identity_headers(dsid, idms_token):
 def trusted_second_factor(dsid, idms_token, session):
     """Use the GSA trusted-device path that matches the SRP login session."""
     headers = _identity_headers(dsid, idms_token)
+    headers['Accept'] = 'text/x-xml-plist'
+    headers['Content-Type'] = 'text/x-xml-plist'
 
     with session.get(
             "https://gsa.apple.com/auth/verify/trusteddevice",
@@ -336,7 +366,7 @@ def trusted_second_factor(dsid, idms_token, session):
             verify=False,
             timeout=10,
     ) as response:
-        response.raise_for_status()
+        _check_http(response, 'Trusted device challenge')
 
     code = getpass("Enter the 6-digit code shown on a trusted Apple device: ").strip()
     if not re.fullmatch(r"\d{6}", code):
@@ -349,7 +379,14 @@ def trusted_second_factor(dsid, idms_token, session):
             verify=False,
             timeout=10,
     ) as response:
-        response.raise_for_status()
+        _check_http(response, 'Trusted device validation')
+        # HTTP 200 alone does not mean that the second factor was accepted.
+        result = plist.loads(response.content)
+        code = result.get('ec')
+        if code is None:
+            code = result.get('Response', {}).get('Status', {}).get('ec')
+        if code != 0:
+            raise AppleAuthError(f'Trusted device validation: Apple code {code!r}')
 
     logger.info("Trusted-device 2FA successful")
 
