@@ -1,4 +1,5 @@
 import os
+import time
 
 import urllib3
 from getpass import getpass
@@ -225,16 +226,34 @@ def gsa_authenticated_request(parameters, session=None):
         "X-MMe-Client-Info": anisette.get('X-Mme-Client-Info', CLIENT_INFO)
     }
 
-    with session.post(
-            "https://gsa.apple.com/grandslam/GsService2",
-            headers=headers,
-            data=plist.dumps(body),
-            verify=False,
-            timeout=5,
-    ) as resp:
-        _check_http(resp, 'GSA ' + parameters.get('o', 'request'))
-
-    return plist.loads(resp.content)["Response"]
+    operation = parameters.get('o', 'request')
+    # Only initialization is replayed. Never automatically resend a password
+    # proof or second-factor request when its outcome is uncertain.
+    delays = (2, 5) if operation == 'init' else ()
+    for attempt in range(len(delays) + 1):
+        retry_delay = None
+        with session.post(
+                "https://gsa.apple.com/grandslam/GsService2",
+                headers=headers,
+                data=plist.dumps(body),
+                verify=False,
+                timeout=5,
+        ) as resp:
+            if resp.status_code in (502, 503, 504) and attempt < len(delays):
+                retry_delay = delays[attempt]
+                # Respect a short numeric Retry-After. Longer cooldowns should
+                # stop here rather than retaining a pending login indefinitely.
+                retry_after = resp.headers.get('Retry-After', '')
+                if retry_after.isdigit():
+                    if int(retry_after) > 30:
+                        raise AppleAuthError('GSA init: server requested a longer cooldown; stop retrying')
+                    retry_delay = max(retry_delay, int(retry_after))
+                logger.warning('GSA init: HTTP %s; retry %s/2 in %ss',
+                               resp.status_code, attempt + 1, retry_delay)
+            else:
+                _check_http(resp, 'GSA ' + operation)
+                return plist.loads(resp.content)["Response"]
+        time.sleep(retry_delay)
 
 
 def generate_cpd(anisette=None):

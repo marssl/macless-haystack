@@ -16,6 +16,47 @@ def response(payload=None, status=200):
 
 
 class AuthContextTests(unittest.TestCase):
+    def test_init_503_then_success_reuses_session(self):
+        session = Mock()
+        session.post.side_effect = [response(status=503), response({'Response': {'Status': {'ec': 0}}})]
+        with patch.object(auth, 'generate_anisette_headers', return_value={}), patch.object(auth.time, 'sleep') as sleep:
+            result = auth.gsa_authenticated_request({'o': 'init', 'A2k': b'A'}, session)
+        self.assertEqual(result['Status']['ec'], 0)
+        self.assertEqual(session.post.call_count, 2)
+        sleep.assert_called_once_with(2)
+        self.assertEqual(session.post.call_args_list[0], session.post.call_args_list[1])
+
+    def test_init_retries_are_bounded(self):
+        session = Mock()
+        session.post.return_value = response(status=503)
+        with patch.object(auth, 'generate_anisette_headers', return_value={}), patch.object(auth.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(auth.AppleAuthError, '503'):
+                auth.gsa_authenticated_request({'o': 'init'}, session)
+        self.assertEqual(session.post.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [2, 5])
+
+    def test_password_proof_and_unauthorized_are_not_retried(self):
+        for operation, status in [('complete', 503), ('init', 401), ('init', 429)]:
+            with self.subTest(operation=operation, status=status):
+                session = Mock()
+                session.post.return_value = response(status=status)
+                with patch.object(auth, 'generate_anisette_headers', return_value={}), patch.object(auth.time, 'sleep') as sleep:
+                    with self.assertRaises(auth.AppleAuthError):
+                        auth.gsa_authenticated_request({'o': operation}, session)
+                self.assertEqual(session.post.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_server_cooldown_is_respected(self):
+        session = Mock()
+        failed = response(status=503)
+        failed.headers['Retry-After'] = '120'
+        session.post.return_value = failed
+        with patch.object(auth, 'generate_anisette_headers', return_value={}), patch.object(auth.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(auth.AppleAuthError, 'cooldown'):
+                auth.gsa_authenticated_request({'o': 'init'}, session)
+        self.assertEqual(session.post.call_count, 1)
+        sleep.assert_not_called()
+
     def test_case_variants_do_not_replace_server_identity(self):
         data = {'X-Apple-I-MD': 'otp', 'X-Apple-I-MD-M': 'machine',
                 'x-mme-device-id': 'server-device', 'x-apple-i-md-lu': 'server-user',

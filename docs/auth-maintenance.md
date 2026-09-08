@@ -12,6 +12,9 @@ authentication.
 - Trusted-device requests returned HTTP 401, including with a Session spanning SRP.
 - These results do NOT prove that Apple disabled GSA globally or that all 401s
   have the same cause. Complete cookie reuse did not resolve this case.
+- With the request-context corrections, a live attempt on 2026-09-08 reached
+  trusted-device challenge HTTP 200 and validation HTTP 200 with Apple `ec=0`.
+  The immediate post-2FA SRP initialization then returned HTTP 503.
 - No successful `auth.json` or ready report endpoint has been verified.
 
 ## Request-context corrections under live validation
@@ -27,6 +30,12 @@ description for GSA and 2FA, and explicit plist headers for trusted devices.
 Client-info is an HTTP header rather than an additional CPD field, matching
 FindMy.py. Validation checks the Apple plist error code as well as HTTP status.
 Authentication response bodies and header values are no longer logged here.
+
+Only SRP initialization now retries explicit HTTP 502/503/504 responses, at most
+twice (2 and 5 seconds), respecting numeric Retry-After up to 30 seconds and
+stopping for longer cooldowns. Password proof and 2FA are never automatically
+replayed. This handles the observed transient-status class but does not prove
+the server's 503 is temporary or that a subsequent attempt will succeed.
 
 Offline checks:
 
